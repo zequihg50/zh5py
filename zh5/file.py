@@ -1,0 +1,735 @@
+import logging
+import math
+import struct
+import urllib.request
+from collections import OrderedDict
+
+from zh5.attr import AttributeMessage
+from zh5.dataset import Dataset, DataspaceMessage
+from zh5.link import LinkMessage, LinkInfoMessage
+
+
+class HTTPRangeReader:
+    def __init__(self, url):
+        self.url = url
+        self.pos = 0
+        self.length = self._get_content_length()
+
+    def _get_content_length(self):
+        req = urllib.request.Request(self.url, method='HEAD')
+        with urllib.request.urlopen(req) as response:
+            return int(response.headers['Content-Length'])
+
+    def read(self, size=-1):
+        if size == -1:
+            size = self.length - self.pos
+        start = self.pos
+        end = start + size - 1
+        headers = {'Range': f'bytes={start}-{end}'}
+        logging.debug(f"HTTP range header request: {headers}.")
+        req = urllib.request.Request(self.url, headers=headers)
+        with urllib.request.urlopen(req) as response:
+            data = response.read()
+        self.pos += len(data)
+        return data
+
+    def seek(self, offset, whence=0):
+        if whence == 0:
+            self.pos = offset
+        elif whence == 1:
+            self.pos += offset
+        elif whence == 2:
+            self.pos = self.length + offset
+        else:
+            raise ValueError("Invalid value for 'whence'.")
+        self.pos = max(0, min(self.pos, self.length))
+
+    def tell(self):
+        return self.pos
+
+
+class Superblock:
+    @property
+    def entrypoint(self):
+        raise NotImplementedError
+
+    @property
+    def version(self):
+        raise NotImplementedError
+
+    @property
+    def size_of_offsets(self):
+        raise NotImplementedError
+
+    @property
+    def size_of_lengths(self):
+        raise NotImplementedError
+
+    @property
+    def superblock_extension_address(self):
+        raise ValueError("This version of the superblock does not support the superblock extension address.")
+
+    @property
+    def undefined_address(self):
+        return 2 ** (self.size_of_offsets * 8) - 1
+
+
+class SuperblockV01(Superblock):
+    def __init__(self, fh, offset):
+        fh.seek(offset)
+        byts = fh.read(24)
+        self._signature = byts[0:8]
+        self._version = byts[9]
+        self._version_file_free_space_storage = byts[10]
+        self._version_root_group_symbol_table_entry = byts[11]
+        # 1 byte empty
+        self._version_number_shared_header_message_format = byts[13]
+        self._size_of_offsets = byts[14]
+        self._size_of_lengths = byts[15]
+        # 1 byte empty
+        self._group_leaf_node_k = int.from_bytes(byts[17:19], "little")
+        self._group_internal_node_k = int.from_bytes(byts[19:21], "little")
+        self._file_consistency_flags = int.from_bytes(byts[21:], "little")
+
+        if self._version == 1:
+            byts = fh.read(4 + self.size_of_offsets * 4 + 4)
+            self._indexed_storage_internal_node_k = int.from_bytes(byts[0:2], "little")
+            # 2 bytes empty
+            byts = byts[4:]
+        else:
+            byts = fh.read(self.size_of_offsets * 4 + 4)
+
+        frm, to = 0, self.size_of_offsets
+        self._base_address = int.from_bytes(byts[frm:to], "little")
+        frm, to = self.size_of_offsets, self.size_of_offsets * 2
+        self._address_of_file_free_space_info = int.from_bytes(byts[frm:to], "little")
+        frm, to = self.size_of_offsets * 2, self.size_of_offsets * 3
+        self._end_of_file_address = int.from_bytes(byts[frm:to], "little")
+        frm, to = self.size_of_offsets * 3, self.size_of_offsets * 4
+        self._driver_information_block_address = int.from_bytes(byts[frm:to], "little")
+
+        self._root_group_symbol_table_entry = int.from_bytes(byts[-4:], "little")
+
+    @property
+    def version(self):
+        return self._version
+
+    @property
+    def entrypoint(self):
+        return self._root_group_symbol_table_entry
+
+    @property
+    def size(self):
+        return 56
+
+    @property
+    def size_of_offsets(self):
+        return self._size_of_offsets
+
+    @property
+    def size_of_lengths(self):
+        return self._size_of_lengths
+
+
+class SuperblockV23(Superblock):
+    def __init__(self, fh, offset):
+        fh.seek(offset)
+        header = struct.unpack_from("8sBBBc", fh.read(12))
+
+        self._signature = header[0]
+        self._version = header[1]
+        self._size_of_offsets = header[2]
+        self._size_of_lengths = header[3]
+        self._file_consistency_flags = header[4]
+        self._base_address = int.from_bytes(fh.read(self.size_of_offsets), "little")
+        self._superblock_extension_address = int.from_bytes(fh.read(self.size_of_offsets), "little")
+        self._end_of_file_address = int.from_bytes(fh.read(self.size_of_offsets), "little")
+        self._root_group_object_header_address = int.from_bytes(fh.read(self.size_of_offsets), "little")
+        self._superblock_checksum = fh.read(4)
+
+    @property
+    def version(self):
+        return self._version
+
+    @property
+    def entrypoint(self):
+        return self._root_group_object_header_address
+
+    @property
+    def size(self):
+        return 0
+
+    @property
+    def size_of_offsets(self):
+        return self._size_of_offsets
+
+    @property
+    def size_of_lengths(self):
+        return self._size_of_lengths
+
+    @property
+    def superblock_extension_address(self):
+        return self._superblock_extension_address
+
+
+class FileReadStrategy:
+    def read(self, n):
+        raise NotImplementedError
+
+    def seek(self, pos):
+        raise NotImplementedError
+
+    def tell(self):
+        raise NotImplementedError
+
+
+class SimpleFileReadStrategy(FileReadStrategy):
+    def __init__(self, file):
+        self._f = file
+
+    def read(self, n):
+        return self._f.read(n)
+
+    def seek(self, pos):
+        self._f.seek(pos)
+
+    def tell(self):
+        return self._f.tell()
+
+
+class PageFileReadStrategy(FileReadStrategy):
+    def __init__(self, file, page_size, pos):
+        self._f = file
+        self._page_size = page_size
+
+        self._pos = pos
+        self._metadata_cache = {}
+
+        self._cache_hits = 0
+        self._cache_misses = 0
+
+    def read(self, n):
+        page = self._pos // self._page_size  # page id of current byte position in the file
+        page_offset = self._page_size * page  # page offset in the file of the page id
+        byte_diff = self._pos - page_offset  # length from page offset in the file to current file offset
+        pages_to_read = math.ceil(n / self._page_size)
+
+        buf = bytearray(n)
+        pending = n
+        frm_page = byte_diff
+        to_page = frm_page + min(self._page_size, pending)
+        for i in range(pages_to_read):
+            frm_buf = n - pending
+            to_buf = frm_buf + min(self._page_size, pending)
+            buf[frm_buf:to_buf] = self._get_page_data(page + i, frm_page, to_page)
+            frm_page = 0
+            pending = pending - (to_buf - frm_buf)
+            to_page = frm_page + min(self._page_size, pending)
+
+        self._pos += n  # update the current position
+
+        return buf
+
+    def seek(self, pos):
+        self._pos = pos
+        self._f.seek(pos)
+
+    def tell(self):
+        return self._pos
+
+    def _read_page(self, pageid):
+        pos = self._page_size * pageid
+        back_to = self._f.tell()
+        self._f.seek(pos)
+        byts = self._f.read(self._page_size)
+        self._f.seek(back_to)
+        return byts
+
+    def _get_page_data(self, pageid, frm, to):
+        if pageid not in self._metadata_cache:
+            self._cache_misses += 1
+            self._metadata_cache[pageid] = self._read_page(pageid)
+        else:
+            self._cache_hits += 1
+
+        return self._metadata_cache[pageid][frm:to]
+
+    @property
+    def cache_hits(self):
+        return self._cache_hits
+
+    @property
+    def cache_misses(self):
+        return self._cache_misses
+
+
+class File:
+    def __init__(self, name):
+        if name.startswith("http://") or name.startswith("https://"):
+            self._fh = HTTPRangeReader(name)
+        else:
+            self._fh = open(name, "rb", buffering=0)
+
+        self._read_strategy = SimpleFileReadStrategy(self._fh)
+        self._root_group = None
+
+        # init the superblock, find it at byte 0, 512, 1024, 2048, ...
+        superblock_begins = 0
+        self._fh.seek(superblock_begins)
+        byts = struct.unpack("8sB", self._fh.read(9))
+        signature = byts[0]
+        if signature != b"\x89HDF\r\n\x1a\n":
+            i = 512
+            while signature != b"\x89HDF\r\n\x1a\n":
+                self._fh.seek(i)
+                signature = self._fh.read(8)
+                superblock_begins = i
+                i *= 2
+        superblock_version = byts[1]
+        if superblock_version == 0 or superblock_version == 1:
+            self._sb = SuperblockV01(self._fh, superblock_begins)
+        elif superblock_version == 2 or superblock_version == 3:
+            self._sb = SuperblockV23(self._fh, superblock_begins)
+        else:
+            raise ValueError("Unknown superblock version.")
+
+    def __getitem__(self, item):
+        return self.root_group[item]
+
+    @property
+    def root_group(self):
+        if self._root_group is None:
+            if self._sb.version < 2:
+                ste = SymbolTableEntry(self, self._sb.entrypoint + self._sb.size)
+                self._root_group = Group(self, ste.object_header_address)
+            elif self._sb.version >= 2 & self._sb.version < 4:
+                self._fh.seek(self._sb.superblock_extension_address)
+                self._root_group = Group(self, self._sb.entrypoint)
+        return self._root_group
+
+    @property
+    def attrs(self):
+        return self.root_group.attrs
+
+    @property
+    def links(self):
+        return self.root_group.links
+
+    @property
+    def size_of_offsets(self):
+        return self._sb.size_of_offsets
+
+    @property
+    def size_of_lengths(self):
+        return self._sb.size_of_offsets
+
+    def datasets(self):
+        yield from self._root_group.datasets()
+
+    def seek(self, pos):
+        self._read_strategy.seek(pos)
+
+    def read(self, n):
+        return self._read_strategy.read(n)
+
+    def tell(self):
+        return self._read_strategy.tell()
+
+    def _read_file_space_info(self):
+        address = self._sb.superblock_extension_address
+        self.seek(address)
+        object_header_version = int.from_bytes(self.read(1), "little")
+
+        if object_header_version == 1:
+            oh = ObjectHeaderV1(self, address)
+        elif object_header_version == 2:
+            oh = ObjectHeaderV2(self, address)
+        else:
+            raise ValueError("Unknown object header version.")
+
+        for m in oh.msgs():
+            if m["type"] == 23:  # FileSpaceInfoMessage
+                self._read_strategy.seek(m["offset"])
+                byts = self._read_strategy.read(2)
+                version = byts[0]
+
+                if version == 0:
+                    file_space_info = FileSpaceInfoV0()
+                elif version == 1:
+                    file_space_info = FileSpaceInfoV1(self, m["offset"], byts[1])
+                else:
+                    raise ValueError("Unknown file space info message version.")
+
+                return file_space_info
+
+    def inspect_metadata(self):
+        yield from self._root_group.inspect_metadata()
+
+
+class PagedFile(File):
+    """This class overrides access methods in order to take advantage of page buffering."""
+
+    def __init__(self, name):
+        super().__init__(name)
+        self._file_space_info = self._read_file_space_info()
+        self._read_strategy = PageFileReadStrategy(
+            self._fh,
+            self.page_size,
+            self._read_strategy.tell())
+
+    def seek(self, pos):
+        self._read_strategy.seek(pos)
+
+    def read(self, n):
+        return self._read_strategy.read(n)
+
+    def tell(self):
+        return self._read_strategy.tell()
+
+    @property
+    def page_size(self):
+        return self._file_space_info.page_size
+
+    @property
+    def cache_hits(self):
+        return self._read_strategy.cache_hits
+
+    @property
+    def cache_misses(self):
+        return self._read_strategy.cache_misses
+
+
+class SymbolTableEntry:
+    def __init__(self, file, offset):
+        self._f = file
+        self._o = offset
+
+        self._f.seek(self._o)
+        byts = self._f.read(self._f.size_of_offsets * 2 + 4 + 4 + 16)
+
+        frm, to = 0, self._f.size_of_offsets
+        self.link_name_offset = int.from_bytes(byts[frm:to], "little")
+        frm, to = self._f.size_of_offsets, 2 * self._f.size_of_offsets
+        self.object_header_address = int.from_bytes(byts[frm:to], "little")
+        frm, to = to, to + 4
+        self.cache_type = int.from_bytes(byts[frm:to], "little")
+        # 4 empty bytes
+        frm, to = to + 4, to + 4 + 16
+        self.scratch_pad = int.from_bytes(byts[frm:to], "little")
+
+
+class ObjectHeader:
+    def msgs(self):
+        raise NotImplementedError
+
+    def inspect_metadata(self, object_name):
+        raise NotImplementedError
+
+
+class ObjectHeaderV1(ObjectHeader):
+    def __init__(self, fh, offset):
+        self._fh = fh
+        self._fh.seek(offset)
+        self._offset = offset
+
+        byts = self._fh.read(16)
+        self.version = byts[0]
+        assert self.version == 1
+        # 1 empty byte
+        self.total_number_of_header_messages = int.from_bytes(byts[2:4], "little")
+        self.object_reference_count = int.from_bytes(byts[4:8], "little")
+        self.object_header_size = int.from_bytes(byts[8:12], "little")
+        # 4 empty bytes
+
+    @property
+    def offset_data(self):
+        return self._offset + 16
+
+    def msgs(self):
+        self._fh.seek(self.offset_data)
+        buffer = self._fh.read(self.object_header_size)
+        offset = 0
+        global_offset = self.offset_data
+        continuation_queue = []
+        for i in range(self.total_number_of_header_messages):
+            if len(buffer) == offset and len(continuation_queue) == 0:
+                break  # never reach this?
+            elif len(buffer) == offset:
+                cm = continuation_queue.pop(0)
+                self._fh.seek(cm.offset)
+                buffer += self._fh.read(cm.length)
+                global_offset = cm.offset
+
+            msg = _unpack_struct_from(OrderedDict((
+                ('type', 'H'),
+                ('size', 'H'),
+                ('flags', 'B'),
+                ('reserved', '3s'),
+            )), buffer, offset)
+            # msg['offset'] = self.offset_data + offset + 8 # los 8 del header_msg_info_v1
+            msg['offset'] = global_offset + 8
+            if msg["type"] == 0x0010:  # OBJECT_CONTINUATION_MSG_TYPE 0x0010
+                fh_off, size = struct.unpack_from('<QQ', buffer, offset + 8)
+                cm = ContinuationMessage(fh_off, size)
+                continuation_queue.append(cm)
+            else:
+                msg['data'] = buffer[offset:offset + msg['size']]
+            offset += msg['size'] + 8
+            global_offset += msg['size'] + 8
+
+            yield msg
+
+    def inspect_metadata(self, object_name):
+        yield {"offset": self._offset, "length": 16, "type": "object_header", "object": object_name}
+        for m in self.msgs():
+            yield {"offset": m["offset"], "length": m["size"], "type": "object_header_message", "object": object_name}
+
+
+class ObjectHeaderV2(ObjectHeader):
+    def __init__(self, fh, offset):
+        self._fh = fh
+        self._offset = offset
+
+        fh.seek(offset)
+        byts = self._fh.read(6)
+        self._signature = byts[0:4]
+        assert self._signature == b"OHDR"
+
+        self._version = byts[4]
+        assert self._version == 2
+
+        self._flags = byts[5]
+        self._size_of_chunk_size = 2 ** (self._flags & 0b11)
+
+        if self._flags & 0b100000:
+            byts = self._fh.read(16)
+            self._access_time = int.from_bytes(byts[0:4], "little")
+            self._modification_time = int.from_bytes(byts[4:8], "little")
+            self._change_time = int.from_bytes(byts[8:12], "little")
+            self._birth_time = int.from_bytes(byts[12:16], "little")
+
+        if self._flags & 0b10000:
+            byts = self._fh.read(4)
+            self._maximum_n_of_compact_attributes = int.from_bytes(byts[0:2], "little")
+            self._minimum_n_of_dense_attributes = int.from_bytes(byts[2:4], "little")
+
+        self._size_of_chunk = int.from_bytes(fh.read(self._size_of_chunk_size), "little")
+        self._offset_data = fh.tell()
+
+    @property
+    def offset_data(self):
+        return self._offset_data
+
+    @property
+    def creation_order_size(self):
+        return (self._flags & 0b100) // 2
+
+    def msgs(self):
+        self._fh.seek(self.offset_data)
+        buffer = self._fh.read(self._size_of_chunk)
+        global_offset = self.offset_data
+        offset = 0
+        continuation_queue = []
+        pending = len(buffer) - offset
+        while pending > 8 or len(continuation_queue) > 0:  # 4 byte checksum
+            if pending <= 4 + 4:  # 4 byte checksum + optional gap
+                cm = continuation_queue.pop(0)
+                self._fh.seek(cm.offset)
+                byts = self._fh.read(cm.length)
+                assert byts[:4] == b"OCHK"
+                buffer = byts[4:]
+                offset = 0
+                global_offset = cm.offset + 4
+
+            msg = _unpack_struct_from(OrderedDict((
+                ('type', 'B'),
+                ('size', 'H'),
+                ('flags', 'B'),
+            )), buffer, offset)
+            msg['offset'] = global_offset + 4 + self.creation_order_size
+
+            if msg["type"] == 0x0010:  # OBJECT_CONTINUATION_MSG_TYPE 0x0010
+                fh_off, size = struct.unpack_from('<QQ', buffer, offset + 4 + self.creation_order_size)
+                cm = ContinuationMessage(fh_off, size)
+                continuation_queue.append(cm)
+
+            offset += msg["size"] + 4 + self.creation_order_size
+            global_offset += msg["size"] + 4 + self.creation_order_size
+            pending = len(buffer) - offset
+
+            yield msg
+
+    def inspect_metadata(self, object_name):
+        yield {"offset": self._offset, "length": self._offset_data - self._offset, "type": "object_header",
+               "object": object_name}
+        for m in self.msgs():
+            yield {"offset": m["offset"], "length": m["size"], "type": "object_header_message", "object": object_name}
+
+
+class ContinuationMessage:
+    def __init__(self, offset, length):
+        self._offset = offset
+        self._length = length
+
+    @property
+    def offset(self):
+        return self._offset
+
+    @property
+    def length(self):
+        return self._length
+
+
+class FileSpaceInfoV0:
+    pass
+
+
+class FileSpaceInfoV1:
+    def __init__(self, file, offset, strategy):
+        self._f = file
+        self._o = offset
+
+        self._strategy = strategy
+
+        self._f.seek(self._o)
+        nbyts = (3 + self._f.size_of_lengths + 5 + 13 * self._f.size_of_offsets)
+        byts = self._f.read(nbyts)
+
+        self._persisting_free_space = byts[3] != 0
+        self._free_space_section_threshold = int.from_bytes(
+            byts[4:4 + self._f.size_of_lengths], "little")
+        self._page_size = int.from_bytes(
+            byts[3 + self._f.size_of_lengths:3 + self._f.size_of_lengths + 4], "little")
+
+    @property
+    def page_size(self):
+        return self._page_size
+
+
+class GroupInfoMessage:
+    def __init__(self, fh, offset, size):
+        self._fh = fh
+        self._offset = offset
+
+        fh.seek(offset)
+        byts = fh.read(2)
+        self._version = byts[0]
+        self._flags = byts[1]
+
+        if self._flags == 1:
+            byts = fh.read(4)
+            self._link_phase_change_maximum_compact_value = byts[:2]
+            self._link_phase_change_minimum_dense_value = byts[2:4]
+        elif self._flags == 2:
+            byts = fh.read(4)
+            self._estimated_number_of_entries = byts[:2]
+            self._estimated_link_name_length_of_entries = byts[2:4]
+        elif self._flags == 3:
+            byts = fh.read(8)
+            self._link_phase_change_maximum_compact_value = byts[:2]
+            self._link_phase_change_minimum_dense_value = byts[2:4]
+            self._estimated_number_of_entries = byts[4:6]
+            self._estimated_link_name_length_of_entries = byts[6:8]
+
+
+class Group:
+    def __init__(self, file, offset):
+        self._f = file
+        self._o = offset
+
+        # guess version of data object
+        self._f.seek(offset)
+        byts = self._f.read(4)
+        if byts == b"OHDR":
+            self._do = ObjectHeaderV2(self._f, offset)
+        else:
+            self._do = ObjectHeaderV1(self._f, offset)
+
+    def __getitem__(self, item):
+        if isinstance(item, str):
+            link = None
+            for l in self.links():
+                if l.name == item:
+                    link = l
+                    break
+            if link is None:
+                raise ValueError
+
+            pos = link.solve()  # byte offset of the object header
+            self._f.seek(pos)
+            byts = self._f.read(5)
+            if byts[0:4] == b"OHDR":
+                oh = ObjectHeaderV2(self._f, pos)
+            elif byts[0] == 0:
+                oh = ObjectHeaderV1(self._f, pos)
+            else:
+                raise ValueError
+
+            # is this a dataset?
+            is_dataset, dataspace = False, None
+            for m in oh.msgs():
+                if m["type"] == 0x0001:  # dataspace message
+                    is_dataset = True
+                    dataspace = DataspaceMessage(self._f, m["offset"])
+
+            if is_dataset:
+                return Dataset(self._f, oh, name=item, dataspace=dataspace)
+            return None
+
+    @property
+    def name(self):
+        return "/"
+
+    @property
+    def attrs(self):
+        d = {}
+        for msg in self._do.msgs():
+            if msg["type"] == 12:
+                attr = AttributeMessage(self._f, msg['offset'], msg['size'])
+                d[attr.name] = attr.value
+        return d
+
+    def links(self):
+        for m in self._do.msgs():
+            if m["type"] == 6:  # link message
+                yield LinkMessage(self._f, m['offset'])
+            elif m["type"] == 2:  # link info message
+                lim = LinkInfoMessage(self._f, m['offset'])
+                for x in lim.solve():
+                    yield x
+            elif m["type"] == 17:  # symbol table message type
+                pass
+
+    def datasets(self):
+        for link in self.links():
+            pos = link.solve()  # byte offset of the object header
+            self._f.seek(pos)
+            byts = self._f.read(5)
+            if byts[0:4] == b"OHDR":
+                oh = ObjectHeaderV2(self._f, pos)
+            elif byts[0] == 0:
+                oh = ObjectHeaderV1(self._f, pos)
+            else:
+                raise ValueError
+
+            # is this a dataset?
+            is_dataset, dataspace = False, None
+            for m in oh.msgs():
+                if m["type"] == 0x0001:  # dataspace message
+                    is_dataset = True
+                    dataspace = DataspaceMessage(self._f, m["offset"])
+
+            if is_dataset:
+                yield Dataset(self._f, oh, name=link.name, dataspace=dataspace)
+
+    def inspect_metadata(self):
+        yield from self._do.inspect_metadata(self.name)
+        for dataset in self.datasets():
+            yield from dataset.inspect_metadata()
+
+
+def _unpack_struct_from(structure, buf, offset=0):
+    """ Unpack a structure into an OrderedDict from a buffer of bytes. """
+    fmt = '<' + ''.join(structure.values())
+    values = struct.unpack_from(fmt, buf, offset=offset)
+    return OrderedDict(zip(structure.keys(), values))
