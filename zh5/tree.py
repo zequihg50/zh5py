@@ -1,18 +1,18 @@
 class BtreeV1:
-    def __init__(self, fh, offset):
-        self._fh = fh
-        self._offset = offset
+    def __init__(self, file, offset):
+        self._f = file
+        self._o = offset
 
-        fh.seek(offset)
-        byts = fh.read(8 + self._fh.size_of_offsets * 2)
+        file.seek(offset)
+        byts = file.read(8 + self._f.size_of_offsets * 2)
         assert byts[:4] == b"TREE"
         self._node_type = byts[4]  # 0 group, 1 dataset
         self._node_level = byts[5]  # 0 is root of the tree
         self._entries_used = int.from_bytes(byts[6:8], "little")
-        self._entries_offset = fh.tell()
-        self._address_left_sibling = int.from_bytes(byts[8:8 + self._fh.size_of_offsets], "little")
+        self._entries_offset = file.tell()
+        self._address_left_sibling = int.from_bytes(byts[8:8 + self._f.size_of_offsets], "little")
         self._address_right_sibling = int.from_bytes(
-            byts[8 + self._fh.size_of_offsets:8 + 2 * self._fh.size_of_offsets], "little")
+            byts[8 + self._f.size_of_offsets:8 + 2 * self._f.size_of_offsets], "little")
 
         # N entries = B-tree contains N child pointers and N+1 keys.
         # Each tree has 2K + 1 keys with 2K child pointers interleaved between
@@ -21,10 +21,10 @@ class BtreeV1:
         # field is N, then the B-tree contains N child pointers and N+1 keys.
         n = self._entries_used + self._entries_used + 1
         bytsl = (
-                self._entries_used * self._fh.size_of_offsets +  # child entries
+                self._entries_used * self._f.size_of_offsets +  # child entries
                 self._entries_used * 24  # 1-4, 4-8, 1dim+64bit
         )
-        byts = fh.read(bytsl)
+        byts = file.read(bytsl)
         # esto es donde está el chunk en bytes en el fichero
         # el tamanio se saca de la key
         # 24 es el tamanio de la primera key, de donde sale? 8+8*2, for type1 nodes
@@ -44,17 +44,17 @@ class BtreeV1:
 
     @property
     def sibling_left(self):
-        return self._address_left_sibling if self._address_left_sibling != self._fh.undefined_address else None
+        return self._address_left_sibling if self._address_left_sibling != self._f.undefined_address else None
 
     @property
     def sibling_right(self):
-        return self._address_right_sibling if self._address_right_sibling != self._fh.undefined_address else None
+        return self._address_right_sibling if self._address_right_sibling != self._f.undefined_address else None
 
     def children(self):
-        self._fh.seek(self._entries_offset)
+        self._f.seek(self._entries_offset)
         for i in range(self._entries_used):
-            self._fh.read(self.keysize)  # read the key
-            byts = self._fh.read(self._fh.size_of_offsets)  # read the child pointer
+            self._f.read(self.keysize)  # read the key
+            byts = self._f.read(self._f.size_of_offsets)  # read the child pointer
 
 
 class BtreeV1Chunk(BtreeV1):
@@ -64,49 +64,80 @@ class BtreeV1Chunk(BtreeV1):
 
     @property
     def keysize(self):
-        return 8 + 8 * (self._dataset.ndims + 1)
+        return 8 + 8 * (self._dataset.ndim + 1)
         # return 24
 
     def chunk_locations(self, counter=0):
         keysize = self.keysize
         for i in range(self._entries_used):
-            self._fh.seek(self._entries_offset + ((keysize + self._fh.size_of_offsets) * i))
-            kbyts = self._fh.read(keysize)  # read the key
-            byts = self._fh.read(self._fh.size_of_offsets)  # read the child pointer
+            self._f.seek(self._entries_offset + ((keysize + self._f.size_of_offsets) * i))
+            kbyts = self._f.read(keysize)  # read the key
+            byts = self._f.read(self._f.size_of_offsets)  # read the child pointer
 
             if self.level == 0:
                 # This is a good place to introduce zarr/kerchunk like indexing
                 # print(f'Chunk {counter} {int.from_bytes(byts, "little")} (size: {int.from_bytes(kbyts[:4], "little")})')
                 counter += 1
             else:
-                back_to = self._fh.tell()
-                child = BtreeV1Chunk(self._fh, int.from_bytes(byts, "little"), self._dataset)
+                back_to = self._f.tell()
+                child = BtreeV1Chunk(self._f, int.from_bytes(byts, "little"), self._dataset)
                 counter = child.chunk_locations(counter)
-                self._fh.seek(back_to)
+                self._f.seek(back_to)
 
         return counter
 
     def inspect_chunks(self):
         keysize = self.keysize
         for i in range(self._entries_used):
-            self._fh.seek(self._entries_offset + ((keysize + self._fh.size_of_offsets) * i))
-            kbyts = self._fh.read(keysize)  # read the key
-            byts = self._fh.read(self._fh.size_of_offsets)  # read the child pointer
+            offset = self._entries_offset + ((keysize + self._f.size_of_offsets) * i)
+            self._f.seek(offset)
+            kbyts = self._f.read(keysize)  # read the key
+            byts = self._f.read(self._f.size_of_offsets)  # read the child pointer
 
-            if self.level == 0:
-                # This is a good place to introduce zarr/kerchunk like indexing
-                # print(f'Chunk {counter} {int.from_bytes(byts, "little")} (size: {int.from_bytes(kbyts[:4], "little")})')
-                yield {"offset": int.from_bytes(byts, "little"),
-                       "length": int.from_bytes(kbyts[:4], "little"),
-                       "type": "chunk",
-                       "object": self._dataset.name}
-            else:
-                child = BtreeV1Chunk(self._fh, int.from_bytes(byts, "little"), self._dataset)
+            chunk_offset_list = []
+            for i in range(self._dataset.ndim):
+                frm = 8 + 8 * i
+                to = frm + 8
+                chunk_offset_list.append(int.from_bytes(kbyts[frm:to], "little"))
+
+            if self.level != 0:
+                child = BtreeV1Chunk(self._f, int.from_bytes(byts, "little"), self._dataset)
                 yield from child.inspect_chunks()
+            else:
+                d = {"offset": int.from_bytes(byts, "little"),
+                     "length": int.from_bytes(kbyts[:4], "little"),
+                     "filter_mask": kbyts[4:8],
+                     "chunk_offset": tuple(chunk_offset_list),
+                     "type": "chunk",
+                     "object": self._dataset.name}
+                yield d
 
 
 class BtreeV1Group(BtreeV1):
-    pass
+    def __init__(self, file, offset, group):
+        super().__init__(file, offset)
+        self._group = group
+
+    @property
+    def keysize(self):
+        return self._f.size_of_lengths
+
+    def symbol_table_entries(self):
+        keysize = self.keysize
+        for i in range(self._entries_used):
+            offset = self._entries_offset + self._f.size_of_offsets + ((keysize + self._f.size_of_offsets) * i)
+            self._f.seek(offset)
+            byts = self._f.read(self._f.size_of_offsets)  # read the child pointer
+            kbyts = self._f.read(keysize)  # read the key
+
+            if self.level != 0:
+                child = BtreeV1Group(self._f, int.from_bytes(byts, "little"), self._group)
+                yield from child.symbol_table_entries()
+            else:
+                entry = {}
+                entry["offset"] = int.from_bytes(kbyts, "little")
+                entry["snod"] = int.from_bytes(byts, "little")
+                yield entry
 
 
 class BtreeV2:

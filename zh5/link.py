@@ -7,6 +7,19 @@ class Link:
         raise NotImplementedError
 
 
+class SimpleLink(Link):
+    def __init__(self, name, offset):
+        self._name = name
+        self._offset = offset
+
+    def solve(self):
+        return self._offset
+
+    @property
+    def name(self):
+        return self._name
+
+
 class LinkInfoMessage(Link):
     def __init__(self, file, offset):
         self._f = file

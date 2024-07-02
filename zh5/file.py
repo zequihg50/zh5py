@@ -5,8 +5,10 @@ import urllib.request
 from collections import OrderedDict
 
 from zh5.attr import AttributeMessage
-from zh5.dataset import Dataset, DataspaceMessage
-from zh5.link import LinkMessage, LinkInfoMessage
+from zh5.dataset import DataspaceMessage, DataLayoutMessageV3, ChunkedDataset
+from zh5.heap import LocalHeap
+from zh5.link import LinkMessage, LinkInfoMessage, SimpleLink
+from zh5.tree import BtreeV1Group
 
 
 class HTTPRangeReader:
@@ -47,6 +49,9 @@ class HTTPRangeReader:
     def tell(self):
         return self.pos
 
+    def close(self):
+        pass
+
 
 class Superblock:
     @property
@@ -67,11 +72,21 @@ class Superblock:
 
     @property
     def superblock_extension_address(self):
-        raise ValueError("This version of the superblock does not support the superblock extension address.")
+        raise ValueError(
+            f"This version of the superblock (version={self.version}) does not support the superblock extension address.")
 
     @property
     def undefined_address(self):
         return 2 ** (self.size_of_offsets * 8) - 1
+
+    @property
+    def group_leaf_node_k(self):
+        raise ValueError(f"This version of the superblock (version={self.version}) does not support Group Leaf Node K.")
+
+    @property
+    def group_internal_node_k(self):
+        raise ValueError(
+            f"This version of the superblock (version={self.version}) does not support Group Internal Node K.")
 
 
 class SuperblockV01(Superblock):
@@ -129,6 +144,14 @@ class SuperblockV01(Superblock):
     @property
     def size_of_lengths(self):
         return self._size_of_lengths
+
+    @property
+    def group_internal_node_k(self):
+        return self._group_internal_node_k
+
+    @property
+    def group_leaf_node_k(self):
+        return self._group_leaf_node_k
 
 
 class SuperblockV23(Superblock):
@@ -262,6 +285,11 @@ class PageFileReadStrategy(FileReadStrategy):
     def cache_misses(self):
         return self._cache_misses
 
+    def reset_cache(self):
+        self._metadata_cache = {}
+        self._cache_hits = 0
+        self._cache_misses = 0
+
 
 class File:
     def __init__(self, name):
@@ -296,6 +324,9 @@ class File:
     def __getitem__(self, item):
         return self.root_group[item]
 
+    def close(self):
+        self._fh.close()
+
     @property
     def root_group(self):
         if self._root_group is None:
@@ -323,6 +354,18 @@ class File:
     def size_of_lengths(self):
         return self._sb.size_of_offsets
 
+    @property
+    def undefined_address(self):
+        return self._sb.undefined_address
+
+    @property
+    def group_leaf_node_k(self):
+        return self._sb.group_leaf_node_k
+
+    @property
+    def group_internal_node_k(self):
+        return self._sb.group_internal_node_k
+
     def datasets(self):
         yield from self._root_group.datasets()
 
@@ -334,6 +377,10 @@ class File:
 
     def tell(self):
         return self._read_strategy.tell()
+
+    def read_chunk(self, offset, size):
+        self.seek(offset)
+        return self.read(size)
 
     def _read_file_space_info(self):
         address = self._sb.superblock_extension_address
@@ -376,6 +423,7 @@ class PagedFile(File):
             self._fh,
             self.page_size,
             self._read_strategy.tell())
+        self._simple_read_strategy = SimpleFileReadStrategy(self._fh)
 
     def seek(self, pos):
         self._read_strategy.seek(pos)
@@ -398,6 +446,17 @@ class PagedFile(File):
     def cache_misses(self):
         return self._read_strategy.cache_misses
 
+    def reset_cache(self):
+        self._read_strategy.reset_cache()
+
+    def read_chunk(self, offset, size):
+        back_to = self._simple_read_strategy.tell()
+        self._simple_read_strategy.seek(offset)
+        chunk = self._simple_read_strategy.read(size)
+        self._simple_read_strategy.seek(back_to)
+
+        return chunk
+
 
 class SymbolTableEntry:
     def __init__(self, file, offset):
@@ -416,6 +475,66 @@ class SymbolTableEntry:
         # 4 empty bytes
         frm, to = to + 4, to + 4 + 16
         self.scratch_pad = int.from_bytes(byts[frm:to], "little")
+
+
+class SymbolTableMessage:
+    def __init__(self, file, offset, group):
+        self._f = file
+        self._o = offset
+        self._group = group
+
+        self._f.seek(self._o)
+        byts = self._f.read(2 * self._f.size_of_offsets)
+        self._btree_address = int.from_bytes(byts[0:self._f.size_of_offsets], "little")
+        self._heap_address = int.from_bytes(byts[self._f.size_of_offsets:], "little")
+
+        self._btree = BtreeV1Group(self._f, self._btree_address, self._group)
+        self._heap = LocalHeap(self._f, self._heap_address)
+
+    def links(self):
+        for snod_offset in self._btree.symbol_table_entries():
+            snod = snod_offset["snod"]
+            symbol_table_node = SymbolTableNode(self._f, snod)
+            for offset, object_header_address in symbol_table_node.links():
+                self._f.seek(self._heap.address_data_segment + offset)
+
+                # the name is null terminated
+                byts = bytearray(0)
+                byt = self._f.read(1)
+                while byt != b"\x00":
+                    byts.append(int.from_bytes(byt, "little"))
+                    byt = self._f.read(1)
+
+                link_name = byts.replace(b"\x00", b"").decode("ascii")
+                link = SimpleLink(link_name, object_header_address)
+                yield link
+
+
+class SymbolTableNode:  # A leaf of a b-tree
+    def __init__(self, file, offset):
+        self._f = file
+        self._o = offset
+
+        self._f.seek(self._o)
+        # byts = self._f.read(12)  # group leaf node k
+        self._entry_size = 2 * self._f.size_of_offsets + 8 + 16
+        byts = self._f.read(8 + 2 * self._f.group_leaf_node_k * self._entry_size)
+
+        assert byts[:4] == b"SNOD"
+        assert byts[4] == 1
+        # 1 empty byte
+        self._number_of_symbols = int.from_bytes(byts[6:8], "little")
+        self._group_entries = byts[8:]
+
+    def links(self):
+        for i in range(self._number_of_symbols):
+            frm, to = i * self._entry_size, i * self._entry_size + self._f.size_of_offsets
+            link_name_offset = int.from_bytes(self._group_entries[frm:to], "little")
+
+            frm, to = to, to + self._f.size_of_offsets
+            object_header_address = int.from_bytes(self._group_entries[frm:to], "little")
+
+            yield link_name_offset, object_header_address
 
 
 class ObjectHeader:
@@ -607,7 +726,7 @@ class FileSpaceInfoV1:
 
 
 class GroupInfoMessage:
-    def __init__(self, fh, offset, size):
+    def __init__(self, fh, offset):
         self._fh = fh
         self._offset = offset
 
@@ -648,6 +767,7 @@ class Group:
     def __getitem__(self, item):
         if isinstance(item, str):
             link = None
+            links = list(self.links())
             for l in self.links():
                 if l.name == item:
                     link = l
@@ -660,20 +780,22 @@ class Group:
             byts = self._f.read(5)
             if byts[0:4] == b"OHDR":
                 oh = ObjectHeaderV2(self._f, pos)
-            elif byts[0] == 0:
+            elif byts[0] == 1:
                 oh = ObjectHeaderV1(self._f, pos)
             else:
                 raise ValueError
 
             # is this a dataset?
-            is_dataset, dataspace = False, None
+            is_dataset, dataspace, layout = False, None, None
             for m in oh.msgs():
                 if m["type"] == 0x0001:  # dataspace message
                     is_dataset = True
                     dataspace = DataspaceMessage(self._f, m["offset"])
+                elif m["type"] == 0x0008:  # layout message
+                    layout = DataLayoutMessageV3(self._f, m["offset"])
 
             if is_dataset:
-                return Dataset(self._f, oh, name=item, dataspace=dataspace)
+                return ChunkedDataset(self._f, oh, name=item, dataspace=dataspace, layout=layout)
             return None
 
     @property
@@ -698,34 +820,8 @@ class Group:
                 for x in lim.solve():
                     yield x
             elif m["type"] == 17:  # symbol table message type
-                pass
-
-    def datasets(self):
-        for link in self.links():
-            pos = link.solve()  # byte offset of the object header
-            self._f.seek(pos)
-            byts = self._f.read(5)
-            if byts[0:4] == b"OHDR":
-                oh = ObjectHeaderV2(self._f, pos)
-            elif byts[0] == 0:
-                oh = ObjectHeaderV1(self._f, pos)
-            else:
-                raise ValueError
-
-            # is this a dataset?
-            is_dataset, dataspace = False, None
-            for m in oh.msgs():
-                if m["type"] == 0x0001:  # dataspace message
-                    is_dataset = True
-                    dataspace = DataspaceMessage(self._f, m["offset"])
-
-            if is_dataset:
-                yield Dataset(self._f, oh, name=link.name, dataspace=dataspace)
-
-    def inspect_metadata(self):
-        yield from self._do.inspect_metadata(self.name)
-        for dataset in self.datasets():
-            yield from dataset.inspect_metadata()
+                symbol_table = SymbolTableMessage(self._f, m['offset'], self)
+                yield from symbol_table.links()
 
 
 def _unpack_struct_from(structure, buf, offset=0):

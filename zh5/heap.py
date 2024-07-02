@@ -1,3 +1,26 @@
+class LocalHeap:
+    def __init__(self, file, offset):
+        self._f = file
+        self._o = offset
+
+        self._f.seek(self._o)
+        byts = self._f.read(8 + 2 * self._f.size_of_lengths + self._f.size_of_offsets)
+
+        assert byts[:4] == b"HEAP"
+        self._version = byts[4]
+
+        frm, to = 8, 8 + self._f.size_of_lengths
+        self._data_segment_size = int.from_bytes(byts[frm:to], "little")
+        frm, to = to, to + self._f.size_of_lengths
+        self._offset_head_free_list = int.from_bytes(byts[frm:to], "little")
+        frm, to = to, to + self._f.size_of_offsets
+        self._address_data_segment = int.from_bytes(byts[frm:to], "little")
+
+    @property
+    def address_data_segment(self):
+        return self._address_data_segment
+
+
 class FractalHeap:
     def __init__(self, file, offset):
         self._f = file
