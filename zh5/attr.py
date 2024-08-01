@@ -1,8 +1,9 @@
 import logging
+import math
 
 
 def find_nearest_multiple_8bytes(n):
-    return round(n / 8) * 8
+    return math.ceil(n / 8) * 8
 
 
 class AttributeMessage:

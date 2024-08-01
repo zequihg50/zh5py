@@ -65,26 +65,25 @@ class BtreeV1Chunk(BtreeV1):
     @property
     def keysize(self):
         return 8 + 8 * (self._dataset.ndim + 1)
-        # return 24
 
-    def chunk_locations(self, counter=0):
+    def inspect_nodes(self):
         keysize = self.keysize
         for i in range(self._entries_used):
-            self._f.seek(self._entries_offset + ((keysize + self._f.size_of_offsets) * i))
+            offset = self._entries_offset + ((keysize + self._f.size_of_offsets) * i)
+            self._f.seek(offset)
             kbyts = self._f.read(keysize)  # read the key
             byts = self._f.read(self._f.size_of_offsets)  # read the child pointer
 
-            if self.level == 0:
-                # This is a good place to introduce zarr/kerchunk like indexing
-                # print(f'Chunk {counter} {int.from_bytes(byts, "little")} (size: {int.from_bytes(kbyts[:4], "little")})')
-                counter += 1
-            else:
-                back_to = self._f.tell()
-                child = BtreeV1Chunk(self._f, int.from_bytes(byts, "little"), self._dataset)
-                counter = child.chunk_locations(counter)
-                self._f.seek(back_to)
+            yield {
+                "level": self._node_level,
+                "entry": i,
+                "offset": offset,
+                "dataset": self._dataset.name,
+            }
 
-        return counter
+            if self.level != 0:
+                child = BtreeV1Chunk(self._f, int.from_bytes(byts, "little"), self._dataset)
+                yield from child.inspect_nodes()
 
     def inspect_chunks(self):
         keysize = self.keysize
@@ -95,8 +94,8 @@ class BtreeV1Chunk(BtreeV1):
             byts = self._f.read(self._f.size_of_offsets)  # read the child pointer
 
             chunk_offset_list = []
-            for i in range(self._dataset.ndim):
-                frm = 8 + 8 * i
+            for j in range(self._dataset.ndim):
+                frm = 8 + 8 * j
                 to = frm + 8
                 chunk_offset_list.append(int.from_bytes(kbyts[frm:to], "little"))
 

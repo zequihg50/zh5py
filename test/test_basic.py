@@ -9,10 +9,9 @@ import zh5
 
 
 class Basic(unittest.TestCase):
-    def test_1d(self):
-        NAME = "1d.h5"
-
-        with h5py.File(NAME, "w") as f:
+    @staticmethod
+    def create_1d(name):
+        with h5py.File(name, "w") as f:
             f.create_dataset("1d", dtype="f8", shape=(10,))
             f.create_dataset("1dchunks", dtype="f4", shape=(10,), chunks=(2,))
             f.create_dataset("1dfilters", dtype="f8", shape=(10,), chunks=(2,), fletcher32=True, shuffle=True,
@@ -20,6 +19,16 @@ class Basic(unittest.TestCase):
             f["1d"][...] = list(range(10))
             f["1dchunks"][...] = list(range(10))
             f["1dfilters"][...] = list(range(10))
+
+    @staticmethod
+    def create_2d(name):
+        with h5py.File(name, "w") as f:
+            f.create_dataset("2d", shape=(10, 10), chunks=(3, 3), compression="gzip", compression_opts=9)
+            f["2d"][...] = np.arange(100).reshape((10, 10))
+
+    def test_1d(self):
+        NAME = "1d.h5"
+        Basic.create_1d(NAME)
 
         f = zh5.File(NAME)
         # assert_array_equal(f["1d"][:], np.arange(10))
@@ -35,10 +44,7 @@ class Basic(unittest.TestCase):
 
     def test2d(self):
         NAME = "2d.h5"
-
-        with h5py.File(NAME, "w") as f:
-            f.create_dataset("2d", shape=(10, 10), chunks=(3, 3), compression="gzip", compression_opts=9)
-            f["2d"][...] = np.arange(100).reshape((10, 10))
+        Basic.create_2d(NAME)
 
         arr = np.arange(100).reshape((10, 10))
         f = zh5.File(NAME)

@@ -1,6 +1,10 @@
+import asyncio
+
+import aiohttp
 import numpy as np
 
 from zh5.codecs import FilterPipelineMessageV1, FilterPipelineMessageV2
+from zh5.dtypes import DatatypeMessage, FloatDatatype, VLStringDatatype, FixedPointDatatype
 from zh5.tree import BtreeV1Chunk
 
 
@@ -25,58 +29,12 @@ class DataLayoutMessageV3:
         return 3
 
     @property
+    def layout_class(self):
+        return self._layout_class
+
+    @property
     def properties_offset(self):
         return self._properties_offset
-
-
-class DatatypeMessage:
-    def __init__(self, file, offset):
-        self._f = file
-        self._o = offset
-
-        self._f.seek(self._o)
-        byts = self._f.read(8)
-
-        self._clazz = byts[0] >> 4
-        self._version = (byts[0] << 4) >> 4
-        # the three class bit fields
-        self._b0 = byts[1]
-        self._b8 = byts[2]
-        self._b16 = byts[3]
-
-        self._size = int.from_bytes(byts[4:8], "little")
-
-    @property
-    def clazz(self):
-        return self._clazz
-
-    @property
-    def version(self):
-        return self._version
-
-    @property
-    def class_bit_fields(self):
-        return self._b0, self._b8, self._b16
-
-    @property
-    def size(self):
-        return self._size
-
-
-class FloatDatatype:
-    def __init__(self, message):
-        self._m = message
-
-    @property
-    def dtype(self):
-        byte_order = self._m.class_bit_fields[0] & 0x01
-        dtype_char = "f"
-        if byte_order == 0:
-            byte_order_char = '<'  # little-endian
-        else:
-            byte_order_char = '>'  # big-endian
-        dtype_string = f"{byte_order_char}f{self._m.size}"
-        return dtype_string
 
 
 class DataspaceMessage:
@@ -118,6 +76,9 @@ class Dataset:
         self._dataspace = dataspace
         self._dtype = dtype
 
+        if self._dtype is None:
+            self.dtype  # Just to initialize the dtype
+
     @property
     def name(self):
         if self._name is None:
@@ -146,10 +107,18 @@ class Dataset:
         if self._dtype is None:
             for m in self._do.msgs():
                 if m["type"] == 0x0003:
-                    dtype = DatatypeMessage(self._f, m["offset"])
+                    dtype_message = DatatypeMessage(self._f, m["offset"])
 
-                    if dtype.clazz == 1:
-                        self._dtype = FloatDatatype(dtype)
+                    if dtype_message.clazz == 0:
+                        self._dtype = FixedPointDatatype(self._f, dtype_message)
+                    elif dtype_message.clazz == 1:
+                        self._dtype = FloatDatatype(self._f, dtype_message)
+                    elif dtype_message.clazz == 9:  # variable-length
+                        b0, b8, b16 = dtype_message.class_bit_fields
+                        if b0 == 0:  # sequence: variable-length sequence of any datatype
+                            pass
+                        elif b0 == 1:  # string
+                            self._dtype = VLStringDatatype(self._f, dtype_message)
                     else:
                         raise ValueError("Not implemented datatype.")
 
@@ -166,6 +135,134 @@ class Dataset:
     # lo suyo esq cada tipo de dataset implemente esto
     def __getitem__(self, item):
         raise NotImplementedError
+
+    def _normalize_slice(self, s, dim):
+        return slice(s.start or 0, s.stop or self.shape[dim], s.step or 1)
+
+    def _normalize_hyperslab(self, item):
+        ndim = self.ndim
+        normalized_hyperslab = []  # list of slices
+
+        if not isinstance(item, tuple):
+            if isinstance(item, slice):
+                normalized_hyperslab.append(self._normalize_slice(item, 0))
+            elif isinstance(item, int):
+                normalized_hyperslab.append(slice(item, item + 1, 1))
+
+            for dim in range(ndim - 1):
+                normalized_hyperslab.append(slice(0, self.shape[dim + 1], 1))
+        elif len(item) < ndim:
+            for dim in range(len(item)):
+                if isinstance(item[dim], int):
+                    normalized_hyperslab.append(slice(item[dim], item[dim] + 1, 1))
+            for dim in range(len(item), ndim):
+                normalized_hyperslab.append(slice(0, self.shape[dim], 1))
+        else:
+            for dim in range(ndim):
+                if isinstance(item[dim], int):
+                    normalized_hyperslab.append(slice(item[dim], item[dim] + 1, 1))
+                else:
+                    normalized_hyperslab.append(self._normalize_slice(item[dim], dim))
+
+        return tuple(normalized_hyperslab)
+
+
+class ContiguousDataset(Dataset):
+    def __init__(self, file, do, name=None, dataspace=None, layout=None):
+        super().__init__(file, do, name, dataspace)
+        self._layout = layout
+
+        self._f.seek(self._layout.properties_offset)
+        byts = self._f.read(self._f.size_of_offsets + self._f.size_of_lengths)
+        self._address = int.from_bytes(byts[:self._f.size_of_offsets], "little")
+        self._size = int.from_bytes(byts[self._f.size_of_offsets:], "little")
+
+    def inspect_chunks(self):
+        pass
+
+    def __getitem__(self, item):
+        if self.address is None:
+            raise ValueError(f"Uninitialized array: {self.name}.")  # ToDo return numpy array with fill value
+
+        normalized_slice = self._normalize_hyperslab(item)
+        if self._dtype.is_memmap:
+            arr = np.memmap(
+                filename=self._f.name,
+                dtype=self.dtype,
+                shape=self.shape,
+                offset=self.address,
+                order="C")
+            return arr[tuple(normalized_slice)]
+        else:
+            # assume it is vlen, each cell is a global_heap_id
+            heap_arr_dtype = np.dtype([
+                ('unknown', np.void, 4),
+                ('global_heap_collection_id', np.int64),
+                ('object_id', np.int32)])
+            heap_arr = np.memmap(
+                filename=self._f.name,
+                dtype=heap_arr_dtype,
+                shape=self.shape,
+                offset=self.address,
+                order="C")[tuple(normalized_slice)]
+            arr = np.vectorize(self._dtype.parse)(heap_arr)
+            return arr
+
+    @property
+    def address(self):
+        if self._address == self._f.undefined_address:
+            return None  # storage not yet allocated for this array
+
+        return self._address
+
+
+class LocalChunkReader:
+    def __init__(self, fname, dataset):
+        self._fname = fname
+        self._dataset = dataset
+
+    def fetch_chunks(self, chunks):
+        results = []
+        with open(self._fname, "rb") as f:
+            for chunk in chunks:
+                f.seek(chunk["byte_offset"])
+                byts = f.read(chunk["byte_length"])
+                if self._dataset.filter_pipeline:
+                    filters = list(self._dataset.filter_pipeline.filters())
+                    for filt in filters[::-1]:
+                        byts = filt.decode(byts)
+                results.append((chunk["chunk_offset"], byts))
+
+        return results
+
+
+class HTTPChunkReader:
+    def __init__(self, fname, dataset):
+        self._url = fname
+        self._dataset = dataset
+
+    async def fetch_chunk(self, session, chunk_id, frm, length):
+        headers = {'Range': f'bytes={frm}-{frm + length}'}
+        async with session.get(self._url, headers=headers) as response:
+            byts = await response.read()
+        if self._dataset.filter_pipeline:
+            filters = list(self._dataset.filter_pipeline.filters())
+            for f in filters[::-1]:
+                byts = f.decode(byts)
+
+        return chunk_id, byts
+
+    async def fetch_chunks_async(self, chunks):
+        async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=10)) as session:
+            tasks = [
+                self.fetch_chunk(session, chunk["chunk_offset"], chunk["byte_offset"], chunk["byte_length"])
+                for chunk in chunks]
+            results = await asyncio.gather(*tasks)
+
+        return results
+
+    def fetch_chunks(self, chunks):
+        return asyncio.run(self.fetch_chunks_async(chunks))
 
 
 class ChunkedDataset(Dataset):
@@ -188,6 +285,19 @@ class ChunkedDataset(Dataset):
         self._itemsize = int.from_bytes(byts[-4:], "little")
 
         self._filter_pipeline = None
+        self._btree = None
+
+        # init the btree chunk cache
+        self._btree_idx = {}
+        for chunk in self.btree.inspect_chunks():
+            chunk_offset = chunk["chunk_offset"]
+            self._btree_idx[chunk_offset] = (chunk["offset"], chunk["length"])
+
+        # chunk reader
+        if self._f.name.startswith("http://") or self._f.name.startswith("https://"):
+            self._cr = HTTPChunkReader(self._f.name, self)
+        else:
+            self._cr = LocalChunkReader(self._f.name, self)
 
     @property
     def address(self):
@@ -205,6 +315,15 @@ class ChunkedDataset(Dataset):
         return self._itemsize
 
     @property
+    def btree(self):
+        if self._btree is None:
+            for m in self._do.msgs():
+                if m["type"] == 8:
+                    self._btree = BtreeV1Chunk(self._f, self.address, self)
+
+        return self._btree
+
+    @property
     def filter_pipeline(self):
         if self._filter_pipeline is None:
             for m in self._do.msgs():
@@ -220,16 +339,16 @@ class ChunkedDataset(Dataset):
 
         return self._filter_pipeline
 
+    def inspect_btree(self):
+        yield from self.btree.inspect_nodes()
+
     def inspect_chunks(self):
         layout, dataspace = None, None
         for m in self._do.msgs():
             if m["type"] == 8:
-                # layout = DataLayoutMessageV3(self._f, m["offset"])
-                # c = ChunkedDataset(self._f, layout.properties_offset)
-                b = BtreeV1Chunk(self._f, self.address, self)
                 counter = 0
                 # this assumes btree yields chunks in order
-                for chunk in b.inspect_chunks():
+                for chunk in self.btree.inspect_chunks():
                     c = chunk.copy()
                     c["id"] = counter
                     yield c
@@ -279,34 +398,8 @@ class ChunkedDataset(Dataset):
                     elif not chunk_queue or c != chunk_queue[-1]:
                         chunk_queue.append(c)
 
-    def normalize_slice(self, s, dim):
-        return slice(s.start or 0, s.stop or self.shape[dim], s.step or 1)
-
     def __getitem__(self, item):
-        ndim = len(self.shape)
-
-        normalized_hyperslab = []  # list of slices
-        if not isinstance(item, tuple):
-            if isinstance(item, slice):
-                normalized_hyperslab.append(self.normalize_slice(item, 0))
-            elif isinstance(item, int):
-                normalized_hyperslab.append(slice(item, item + 1, 1))
-
-            for dim in range(ndim - 1):
-                normalized_hyperslab.append(slice(0, self.shape[dim + 1], 1))
-        elif len(item) < ndim:
-            for dim in range(len(item)):
-                if isinstance(item[dim], int):
-                    normalized_hyperslab.append(slice(item[dim], item[dim] + 1, 1))
-            for dim in range(len(item), ndim):
-                normalized_hyperslab.append(slice(0, self.shape[dim], 1))
-        else:
-            for dim in range(ndim):
-                if isinstance(item[dim], int):
-                    normalized_hyperslab.append(slice(item[dim], item[dim] + 1, 1))
-                else:
-                    normalized_hyperslab.append(self.normalize_slice(item[dim], dim))
-        normalized_hyperslab = tuple(normalized_hyperslab)
+        normalized_hyperslab = self._normalize_hyperslab(item)
 
         # get the chunks and fill the numpy array
         chunks = np.array(list(self.get_chunk_coords_dataset_projection(tuple(normalized_hyperslab))))
@@ -316,30 +409,25 @@ class ChunkedDataset(Dataset):
                              chunks.min(axis=0, initial=max(self.shape)) +
                              np.array(self.chunkshape))
         data = np.empty(padded_shape, dtype="f4")
-
         chunk_origin = chunks.min(axis=0, initial=max(self.shape))
-        available_chunks = list(self.inspect_chunks())
+
+        matched_chunks = []
         for requested_chunk in chunks:
-            for available_chunk in available_chunks:
-                if tuple(requested_chunk) == available_chunk["chunk_offset"]:
-                    # read chunk data
-                    chunk_buffer = self._f.read_chunk(
-                        available_chunk["offset"], available_chunk["length"])
+            requested_chunk_tuple = tuple(requested_chunk)
+            if requested_chunk_tuple in self._btree_idx:
+                matched_chunks.append({
+                    "chunk_offset": requested_chunk_tuple,
+                    "byte_offset": self._btree_idx[requested_chunk_tuple][0],
+                    "byte_length": self._btree_idx[requested_chunk_tuple][1]})
 
-                    # filter pipeline
-                    if self.filter_pipeline:
-                        filters = list(self.filter_pipeline.filters())
-                        for f in filters[::-1]:
-                            chunk_buffer = f.decode(chunk_buffer)
-
-                    # chunk array
-                    chunk_arr = np.frombuffer(chunk_buffer, self.dtype).reshape(self.chunkshape)
-
-                    chunk_vector = np.array(available_chunk["chunk_offset"])
-                    region = tuple([slice(i, i + j) for i, j in zip((chunk_vector - chunk_origin), self.chunkshape)])
-                    data[region] = chunk_arr
+        for chunk_offset, chunk_buffer in self._cr.fetch_chunks(matched_chunks):
+            chunk_arr = np.frombuffer(chunk_buffer, self.dtype).reshape(self.chunkshape)
+            chunk_vector = np.array(chunk_offset)
+            region = tuple([slice(i, i + j) for i, j in zip((chunk_vector - chunk_origin), self.chunkshape)])
+            data[region] = chunk_arr
 
         # restrict the selection to the area requested by the user
         region = tuple([slice(s.start - chunk_origin[i], s.stop - chunk_origin[i], s.step)
                         for i, s in enumerate(normalized_hyperslab)])
+
         return data[region]

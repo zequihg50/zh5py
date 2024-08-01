@@ -5,8 +5,8 @@ import urllib.request
 from collections import OrderedDict
 
 from zh5.attr import AttributeMessage
-from zh5.dataset import DataspaceMessage, DataLayoutMessageV3, ChunkedDataset
-from zh5.heap import LocalHeap
+from zh5.dataset import DataspaceMessage, DataLayoutMessageV3, ChunkedDataset, ContiguousDataset
+from zh5.heap import LocalHeap, GlobalHeap
 from zh5.link import LinkMessage, LinkInfoMessage, SimpleLink
 from zh5.tree import BtreeV1Group
 
@@ -293,6 +293,7 @@ class PageFileReadStrategy(FileReadStrategy):
 
 class File:
     def __init__(self, name):
+        self._name = name
         if name.startswith("http://") or name.startswith("https://"):
             self._fh = HTTPRangeReader(name)
         else:
@@ -300,6 +301,7 @@ class File:
 
         self._read_strategy = SimpleFileReadStrategy(self._fh)
         self._root_group = None
+        self._global_heap = GlobalHeap(self)
 
         # init the superblock, find it at byte 0, 512, 1024, 2048, ...
         superblock_begins = 0
@@ -326,6 +328,10 @@ class File:
 
     def close(self):
         self._fh.close()
+
+    @property
+    def name(self):
+        return self._name
 
     @property
     def root_group(self):
@@ -411,6 +417,9 @@ class File:
 
     def inspect_metadata(self):
         yield from self._root_group.inspect_metadata()
+
+    def get_global_heap(self, heap_id):
+        return self._global_heap[heap_id]
 
 
 class PagedFile(File):
@@ -794,9 +803,16 @@ class Group:
                 elif m["type"] == 0x0008:  # layout message
                     layout = DataLayoutMessageV3(self._f, m["offset"])
 
+            dataset = None
             if is_dataset:
-                return ChunkedDataset(self._f, oh, name=item, dataspace=dataspace, layout=layout)
-            return None
+                if layout.layout_class == 2:
+                    dataset = ChunkedDataset(self._f, oh, name=item, dataspace=dataspace, layout=layout)
+                elif layout.layout_class == 1:
+                    dataset = ContiguousDataset(self._f, oh, name=item, dataspace=dataspace, layout=layout)
+                else:
+                    raise ValueError(f"Layout class not supported ({layout.layout_class}).")
+
+            return dataset
 
     @property
     def name(self):

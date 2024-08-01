@@ -1,3 +1,6 @@
+import math
+
+
 class LocalHeap:
     def __init__(self, file, offset):
         self._f = file
@@ -19,6 +22,73 @@ class LocalHeap:
     @property
     def address_data_segment(self):
         return self._address_data_segment
+
+
+class GlobalHeapObject:
+    def __init__(self, file):
+        self._f = file
+
+        byts = self._f.read(8 + self._f.size_of_lengths)
+
+        self._heap_object_index = int.from_bytes(byts[:2], "little")
+        self._reference_count = int.from_bytes(byts[2:4], "little")
+        # 4 empty bytes
+        size = int.from_bytes(byts[-self._f.size_of_lengths:], "little")
+        self._object_size = math.ceil(size / 8) * 8
+        self._object_data = self._f.read(self._object_size)
+
+    @property
+    def index(self):
+        return self._heap_object_index
+
+    @property
+    def data(self):
+        return self._object_data
+
+
+class GlobalHeapCollection:
+    def __init__(self, file, offset):
+        self._f = file
+        self._o = offset
+        self._offset_data = self._o + 8 + self._f.size_of_lengths
+
+        self._f.seek(self._o)
+        byts = self._f.read(8 + self._f.size_of_lengths)
+
+        assert byts[:4] == b"GCOL"
+        assert byts[4] == 1
+
+        self._size = int.from_bytes(byts[8:8 + self._f.size_of_lengths], "little")  # size in bytes
+
+        # load all the values into memory
+        # questionable but I/O efficient assuming the heap is not too big (important for remote data access)
+        # 127 16-byte heap objects plus their overhead (the collection header of 16 bytes and the 16 bytes
+        # of information about each heap object)
+        self._values = []
+        heap_object = GlobalHeapObject(self._f)
+        while heap_object.index != 0 and heap_object.index < 128:
+            self._values.append(heap_object)
+            heap_object = GlobalHeapObject(self._f)
+
+    def __getitem__(self, item):  # item is the integer id of the global heap object (1 to N)
+        if item > self._size:
+            raise ValueError(
+                f"Asking for global heap {self._o} object id {item} greater than collection size {self._size}.")
+
+        return self._values[item]
+
+
+# The Global Heap is the set of collections, which are independent of each other and
+# can be localized only when reference by some other object
+class GlobalHeap:
+    def __init__(self, file):
+        self._f = file
+        self._collections = {}  # the key is the offset of the collection
+
+    def __getitem__(self, item):  # item is the offset of the collection
+        if item not in self._collections:
+            self._collections[item] = GlobalHeapCollection(self._f, item)
+        return self._collections[item]
 
 
 class FractalHeap:
