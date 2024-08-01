@@ -1,5 +1,4 @@
 import logging
-import math
 import struct
 import urllib.request
 from collections import OrderedDict
@@ -9,6 +8,8 @@ from zh5.dataset import DataspaceMessage, DataLayoutMessageV3, ChunkedDataset, C
 from zh5.heap import LocalHeap, GlobalHeap
 from zh5.link import LinkMessage, LinkInfoMessage, SimpleLink
 from zh5.tree import BtreeV1Group
+
+SIGNATURE = b"\x89HDF\r\n\x1a\n"
 
 
 class HTTPRangeReader:
@@ -53,6 +54,27 @@ class HTTPRangeReader:
         pass
 
 
+class DriverInformationBlock:
+    def __init__(self, file, offset):
+        self._f = file
+        self._o = offset
+
+        self._f.seek(self._o)
+        byts = self._f.read(16)
+        self._version = byts[0]
+        self._driver_information_size = int.from_bytes(byts[4:8], "little")
+        self._driver_identification = byts[8:16]
+        self._driver_information = self._f.read(self._driver_information_size)
+
+    @property
+    def driver_identification(self):
+        return self._driver_identification
+
+    @property
+    def driver_information(self):
+        return self._driver_information
+
+
 class Superblock:
     @property
     def entrypoint(self):
@@ -88,11 +110,18 @@ class Superblock:
         raise ValueError(
             f"This version of the superblock (version={self.version}) does not support Group Internal Node K.")
 
+    @property
+    def driver(self):
+        raise NotImplementedError
+
 
 class SuperblockV01(Superblock):
     def __init__(self, fh, offset):
         fh.seek(offset)
         byts = fh.read(24)
+        self._f = fh
+        self._o = offset
+
         self._signature = byts[0:8]
         self._version = byts[9]
         self._version_file_free_space_storage = byts[10]
@@ -120,8 +149,12 @@ class SuperblockV01(Superblock):
         self._address_of_file_free_space_info = int.from_bytes(byts[frm:to], "little")
         frm, to = self.size_of_offsets * 2, self.size_of_offsets * 3
         self._end_of_file_address = int.from_bytes(byts[frm:to], "little")
+
         frm, to = self.size_of_offsets * 3, self.size_of_offsets * 4
         self._driver_information_block_address = int.from_bytes(byts[frm:to], "little")
+        self._driver_information_block = None
+        if self._driver_information_block_address != self.undefined_address:
+            self._driver_information_block = DriverInformationBlock(self._f, self._driver_information_block_address)
 
         self._root_group_symbol_table_entry = int.from_bytes(byts[-4:], "little")
 
@@ -153,9 +186,16 @@ class SuperblockV01(Superblock):
     def group_leaf_node_k(self):
         return self._group_leaf_node_k
 
+    @property
+    def driver(self):
+        return self._driver_information_block
+
 
 class SuperblockV23(Superblock):
     def __init__(self, fh, offset):
+        self._f = fh
+        self._o = offset
+
         fh.seek(offset)
         header = struct.unpack_from("8sBBBc", fh.read(12))
 
@@ -193,6 +233,10 @@ class SuperblockV23(Superblock):
     @property
     def superblock_extension_address(self):
         return self._superblock_extension_address
+
+    @property
+    def driver(self):
+        raise NotImplementedError
 
 
 class FileReadStrategy:
@@ -235,19 +279,20 @@ class PageFileReadStrategy(FileReadStrategy):
         page = self._pos // self._page_size  # page id of current byte position in the file
         page_offset = self._page_size * page  # page offset in the file of the page id
         byte_diff = self._pos - page_offset  # length from page offset in the file to current file offset
-        pages_to_read = math.ceil(n / self._page_size)
 
         buf = bytearray(n)
         pending = n
         frm_page = byte_diff
-        to_page = frm_page + min(self._page_size, pending)
-        for i in range(pages_to_read):
+        to_page = min(self._page_size, frm_page + pending)
+        i = 0  # counts the number of pages read
+        while pending > 0:
             frm_buf = n - pending
-            to_buf = frm_buf + min(self._page_size, pending)
+            to_buf = frm_buf + (to_page - frm_page)
             buf[frm_buf:to_buf] = self._get_page_data(page + i, frm_page, to_page)
             frm_page = 0
             pending = pending - (to_buf - frm_buf)
-            to_page = frm_page + min(self._page_size, pending)
+            to_page = min(self._page_size, frm_page + pending)
+            i += 1
 
         self._pos += n  # update the current position
 
@@ -308,9 +353,9 @@ class File:
         self._fh.seek(superblock_begins)
         byts = struct.unpack("8sB", self._fh.read(9))
         signature = byts[0]
-        if signature != b"\x89HDF\r\n\x1a\n":
+        if signature != SIGNATURE:
             i = 512
-            while signature != b"\x89HDF\r\n\x1a\n":
+            while signature != SIGNATURE:
                 self._fh.seek(i)
                 signature = self._fh.read(8)
                 superblock_begins = i
@@ -340,7 +385,6 @@ class File:
                 ste = SymbolTableEntry(self, self._sb.entrypoint + self._sb.size)
                 self._root_group = Group(self, ste.object_header_address)
             elif self._sb.version >= 2 & self._sb.version < 4:
-                self._fh.seek(self._sb.superblock_extension_address)
                 self._root_group = Group(self, self._sb.entrypoint)
         return self._root_group
 
@@ -372,6 +416,18 @@ class File:
     def group_internal_node_k(self):
         return self._sb.group_internal_node_k
 
+    @property
+    def meta_name(self):
+        return self.name
+
+    @property
+    def raw_name(self):
+        return self.name
+
+    @property
+    def chunk_offset(self):
+        return 0
+
     def datasets(self):
         yield from self._root_group.datasets()
 
@@ -383,10 +439,6 @@ class File:
 
     def tell(self):
         return self._read_strategy.tell()
-
-    def read_chunk(self, offset, size):
-        self.seek(offset)
-        return self.read(size)
 
     def _read_file_space_info(self):
         address = self._sb.superblock_extension_address
@@ -421,13 +473,25 @@ class File:
     def get_global_heap(self, heap_id):
         return self._global_heap[heap_id]
 
+    @property
+    def driver(self):
+        return self._sb.driver
+
+    def project_chunk(self, chunk_offset):
+        return chunk_offset
+
 
 class PagedFile(File):
     """This class overrides access methods in order to take advantage of page buffering."""
 
     def __init__(self, name):
         super().__init__(name)
-        self._file_space_info = self._read_file_space_info()
+
+        if self._sb.superblock_extension_address != self.undefined_address:
+            self._file_space_info = self._read_file_space_info()
+        else:
+            self._file_space_info = None
+
         self._read_strategy = PageFileReadStrategy(
             self._fh,
             self.page_size,
@@ -445,6 +509,9 @@ class PagedFile(File):
 
     @property
     def page_size(self):
+        if self._sb.superblock_extension_address == self.undefined_address:
+            return 4096
+
         return self._file_space_info.page_size
 
     @property
@@ -458,13 +525,103 @@ class PagedFile(File):
     def reset_cache(self):
         self._read_strategy.reset_cache()
 
-    def read_chunk(self, offset, size):
-        back_to = self._simple_read_strategy.tell()
-        self._simple_read_strategy.seek(offset)
-        chunk = self._simple_read_strategy.read(size)
-        self._simple_read_strategy.seek(back_to)
 
-        return chunk
+class SplitFile(File):
+    def __init__(self, name, meta_ext=None, raw_ext=None):
+        self._name = name
+        self._meta_ext = meta_ext
+        self._raw_ext = raw_ext
+        if self._meta_ext is None:
+            self._meta_ext = "-m.h5"
+        if self._raw_ext is None:
+            self._raw_ext = "-r.h5"
+
+        super().__init__(f"{name}{self._meta_ext}")
+
+        if name.startswith("http://") or name.startswith("https://"):
+            with urllib.request.urlopen(self.meta_name) as response:
+                self._meta = response.read()
+        else:
+            with open(self.meta_name, "rb") as fh:
+                self._meta = fh.read()
+        self._pos = 0
+
+    @property
+    def raw_name(self):
+        return f"{self._name.rstrip(self._meta_ext)}{self._raw_ext}"
+
+    @property
+    def meta_name(self):
+        return f"{self._name}"
+
+    @property
+    def name(self):
+        return f"{self._name}"
+
+    def read(self, n):
+        byts = self._meta[self._pos:self._pos + n]
+        self._pos += n
+        return byts
+
+    def seek(self, pos):
+        self._pos = pos
+
+    def tell(self):
+        return self._pos
+
+    def close(self):
+        self._fh.close()
+
+    # Properties related to the "split" driver
+    @property
+    def members(self):
+        # 1 superblock, 2 btree, 3 raw data, 4 global heap, 5 local heap, 6 object header
+        byts = self.driver.driver_information
+        members = {
+            "superblock": {
+                "member": byts[0]
+            },
+            "btree": {
+                "member": byts[1]
+            },
+            "raw": {
+                "member": byts[2]
+            },
+            "global_heap": {
+                "member": byts[3]
+            },
+            "local_heap": {
+                "member": byts[4]
+            },
+            "object_header": {
+                "member": byts[5]
+            }
+        }
+
+        n_members = len(set([members[x]["member"] for x in members]))
+        name_offset = 8 + 16 * len(members)
+        for member in members:
+            offset = 0 if members[member]["member"] == 1 else 1
+            address_offset = 8 + offset * 16  # 16 is two times 8, one for address and one for end of address (address, length)
+            members[member]["address"] = int.from_bytes(
+                byts[address_offset:address_offset + 8], "little")
+            members[member]["length"] = int.from_bytes(
+                byts[address_offset + 8:address_offset + 16], "little")
+
+            # ToDo
+            members[member]["name"] = ""
+            name_offset += 0
+
+        return members
+
+    def project_chunk(self, chunk_offset):
+        '''The driver information block for the "split" driver is the information block for the "multi"
+         driver (see Layout: Multi Driver Information).
+        :return: Projected chunk offset.
+        '''
+        members = self.members
+        offset = chunk_offset - members["raw"]["address"]
+        return offset
 
 
 class SymbolTableEntry:
@@ -776,7 +933,7 @@ class Group:
     def __getitem__(self, item):
         if isinstance(item, str):
             link = None
-            links = list(self.links())
+            # links = list(self.links())
             for l in self.links():
                 if l.name == item:
                     link = l

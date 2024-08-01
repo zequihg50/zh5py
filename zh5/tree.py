@@ -3,8 +3,8 @@ class BtreeV1:
         self._f = file
         self._o = offset
 
-        file.seek(offset)
-        byts = file.read(8 + self._f.size_of_offsets * 2)
+        self._f.seek(self._o)
+        byts = self._f.read(8 + self._f.size_of_offsets * 2)
         assert byts[:4] == b"TREE"
         self._node_type = byts[4]  # 0 group, 1 dataset
         self._node_level = byts[5]  # 0 is root of the tree
@@ -185,7 +185,7 @@ class BtreeV2:
     def parse_record(self):  # de momento retorno dict, ya veré como hacer esto
         d = {}
         if self._type == 6:
-            byts = self._f.read(15)
+            byts = self._f.read(self.record_size)
             d["creation_order"] = int.from_bytes(byts[:8], "little")
             d["heap_id"] = byts[8:]
 
@@ -211,18 +211,23 @@ class BtreeV2LeafNode:
         # for this node and the record size (from the header). The format of records
         # depends on the type of B-tree.
         self._record_offset = self._f.tell()
-        self._record_size = self._tree.record_size * self._tree.nrecords
+        self._record_size = self._tree.record_size
+        self._records_size = self._tree.record_size * self._tree.nrecords
 
-        self._f.seek(self._record_offset + self._record_size)
+        self._f.seek(self._record_offset + self._records_size)
         self._checksum = self._f.read(4)
 
+    @property
+    def record_size(self):
+        return self._record_size
+
     def records(self):
-        self._f.seek(self._record_offset)
         for i in range(self._tree.nrecords):
+            self._f.seek(self._record_offset + self.record_size * i)
             record = self._tree.parse_record()
-            pos = self._f.tell()
+            # pos = self._f.tell()
             yield record
-            self._f.seek(pos)
+            # self._f.seek(pos)
 
 
 class BtreeV2InternalNode:

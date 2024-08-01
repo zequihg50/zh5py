@@ -43,11 +43,25 @@ class DataspaceMessage:
         self._o = offset
 
         self._f.seek(self._o)
-        byts = self._f.read(5)
+        byts = self._f.read(4)
         self._version = byts[0]
         self._dimensionality = byts[1]
+        self._flags = byts[2]
 
-        self._shape = None
+        shape = []
+        if self._version == 1:
+            byts = self._f.read(4 + self._f.size_of_lengths * self.dimensionality)[4:]
+        elif self._version == 2:
+            self._type = byts[3]
+            byts = self._f.read(self._f.size_of_lengths * self.dimensionality)
+        else:
+            raise ValueError(f"Unknown dataspace message version {self._version}.")
+
+        for i in range(self.dimensionality):
+            frm = self._f.size_of_lengths * i
+            to = frm + self._f.size_of_lengths
+            shape.append(int.from_bytes(byts[frm:to], "little"))
+        self._shape = tuple(shape)
 
     @property
     def dimensionality(self):
@@ -55,16 +69,6 @@ class DataspaceMessage:
 
     @property
     def shape(self):
-        if self._shape is None:
-            self._f.seek(self._o + 8)
-            shape = []
-            byts = self._f.read(self._f.size_of_lengths * self.dimensionality)
-            for i in range(self.dimensionality):
-                frm = self._f.size_of_lengths * i
-                to = frm + self._f.size_of_lengths
-                shape.append(int.from_bytes(byts[frm:to], "little"))
-            self._shape = tuple(shape)
-
         return self._shape
 
 
@@ -245,19 +249,25 @@ class HTTPChunkReader:
         headers = {'Range': f'bytes={frm}-{frm + length}'}
         async with session.get(self._url, headers=headers) as response:
             byts = await response.read()
-        if self._dataset.filter_pipeline:
-            filters = list(self._dataset.filter_pipeline.filters())
-            for f in filters[::-1]:
-                byts = f.decode(byts)
+            if self._dataset.filter_pipeline:
+                filters = list(self._dataset.filter_pipeline.filters())
+                for f in filters[::-1]:
+                    byts = f.decode(byts)
 
         return chunk_id, byts
 
     async def fetch_chunks_async(self, chunks):
-        async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=10)) as session:
+        # https://github.com/aio-libs/aiohttp/issues/1925#issuecomment-2030109671
+        async with aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(limit=20, force_close=True, enable_cleanup_closed=True)) as session:
             tasks = [
                 self.fetch_chunk(session, chunk["chunk_offset"], chunk["byte_offset"], chunk["byte_length"])
                 for chunk in chunks]
             results = await asyncio.gather(*tasks)
+
+        # # https://docs.aiohttp.org/en/stable/client_advanced.html#graceful-shutdown
+        # # https://github.com/aio-libs/aiohttp/issues/1925
+        # await asyncio.sleep(0.250)
 
         return results
 
@@ -295,9 +305,9 @@ class ChunkedDataset(Dataset):
 
         # chunk reader
         if self._f.name.startswith("http://") or self._f.name.startswith("https://"):
-            self._cr = HTTPChunkReader(self._f.name, self)
+            self._cr = HTTPChunkReader(self._f.raw_name, self)
         else:
-            self._cr = LocalChunkReader(self._f.name, self)
+            self._cr = LocalChunkReader(self._f.raw_name, self)
 
     @property
     def address(self):
@@ -417,7 +427,7 @@ class ChunkedDataset(Dataset):
             if requested_chunk_tuple in self._btree_idx:
                 matched_chunks.append({
                     "chunk_offset": requested_chunk_tuple,
-                    "byte_offset": self._btree_idx[requested_chunk_tuple][0],
+                    "byte_offset": self._f.project_chunk(self._btree_idx[requested_chunk_tuple][0]),
                     "byte_length": self._btree_idx[requested_chunk_tuple][1]})
 
         for chunk_offset, chunk_buffer in self._cr.fetch_chunks(matched_chunks):

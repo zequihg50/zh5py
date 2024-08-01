@@ -1,1 +1,1 @@
-from .file import File, PagedFile
+from .file import File, PagedFile, SplitFile

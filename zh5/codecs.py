@@ -115,6 +115,13 @@ class FilterDescriptionV2(FilterDescription):
         return self._name
 
     @property
+    def size(self):
+        if self._size is None:
+            self._size = 8 + len(self.name) + 4 * self._number_client_data_values
+
+        return self._size
+
+    @property
     def client_data(self):
         if self._client_data is None:
             self._f.seek(self._offset_data)

@@ -24,7 +24,6 @@ class LinkInfoMessage(Link):
     def __init__(self, file, offset):
         self._f = file
         self._o = offset
-        self._undefined_address = b"".join([b"\xff"] * self._f.size_of_offsets)
 
         self._f.seek(offset)
         byts = self._f.read(2)
@@ -59,8 +58,8 @@ class LinkInfoMessage(Link):
             self._address_of_v2_btree_for_creation_order_index = int.from_bytes(
                 byts[2 * self._f.size_of_offsets:3 * self._f.size_of_offsets], "little")
         elif self._flags == 3:
-            byts = self._f.read(24 + 8)
-            self._maximum_creation_index = byts[:8]
+            byts = self._f.read(8 + self._f.size_of_offsets * 3)
+            self._maximum_creation_index = int.from_bytes(byts[:8], "little")
             self._fractal_heap_address = int.from_bytes(byts[8:8 + self._f.size_of_offsets], "little")
             self._address_of_v2_btree_for_name_index = int.from_bytes(
                 byts[8 + self._f.size_of_offsets:8 + 2 * self._f.size_of_offsets], "little")
@@ -75,8 +74,8 @@ class LinkInfoMessage(Link):
 
     def solve(self):
         for record in self._btree_order.records():
-            data = self._heap.get_data(record["heap_id"])
-            l = LinkMessage(self._f, data)
+            offset = self._heap.get_data(record["heap_id"])
+            l = LinkMessage(self._f, offset)
             yield l
 
 

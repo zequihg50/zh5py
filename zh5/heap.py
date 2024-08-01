@@ -91,13 +91,99 @@ class GlobalHeap:
         return self._collections[item]
 
 
+class FractalHeapIndirectBlock:
+    def __init__(self, file, offset, heap, nrows):
+        self._f = file
+        self._o = offset
+        self._heap = heap
+        self._nrows = nrows
+
+        self._f.seek(self._o)
+        byts = self._f.read(5 + self._f.size_of_offsets)
+        assert byts[:4] == b"FHIB"
+        self._version = byts[4]
+        self._heap_header_address = int.from_bytes(byts[5:5 + self._f.size_of_offsets], "little")  # for integrity
+        self._block_offset = int.from_bytes(self._f.read(self._heap.maximum_heap_size), "little")
+
+        self._offset_data = self._f.tell()
+
+    def read(self):
+        # py5 _indirect_info (is this only for root indirect block?)
+        nobjects = self._nrows * self._heap.table_width
+        ndirect_max = self._heap.max_dblock_rows * self._heap.table_width
+        if self._nrows <= ndirect_max:
+            ndirect = nobjects
+            nindirect = 0
+        else:
+            ndirect = ndirect_max
+            nindirect = nobjects - ndirect_max
+
+        self._f.seek(self._offset_data)
+        direct, indirect = [], []
+        for i in range(ndirect):
+            address = int.from_bytes(self._f.read(8), "little")
+            if address == self._f.undefined_address:
+                break
+            row = i // self._heap.table_width
+            block_size = 2 ** max(row - 1, 0) * self._heap.starting_block_size
+            direct.append((address, block_size))
+        for i in range(nindirect):
+            address = int.from_bytes(self._f.read(8), "little")
+            if address == self._f.undefined_address:
+                break
+            row = i // self._heap.table_width
+            block_size = 2 ** max(row - 1, 0) * self._heap.starting_block_size
+            indirect.append((address, block_size))
+
+        for address, block_size in direct:
+            block = FractalHeapDirectBlock(self._f, address, self._heap, block_size)
+            obj = block
+            yield obj
+
+        for address, nrows in indirect:
+            block = FractalHeapIndirectBlock(self._f, address, self._heap, nrows)
+            for obj in block.read():
+                yield obj
+
+
+class FractalHeapDirectBlock:
+    def __init__(self, file, offset, heap, size):
+        self._f = file
+        self._o = offset
+        self._heap = heap
+        self._size = size
+
+        self._f.seek(self._o)
+        byts = self._f.read(5 + self._f.size_of_offsets)
+        assert byts[:4] == b"FHDB"
+        assert byts[4] == 0
+
+        self._heap_header_address = int.from_bytes(byts[5:5 + self._f.size_of_offsets], "little")
+
+        nbyts = math.ceil(self._heap.maximum_heap_size / 8)
+        self._block_offset = int.from_bytes(self._f.read(nbyts), "little")
+
+    def read(self):
+        self._f.seek(self._o)
+        byts = self._f.read(self._size)
+        return byts
+
+    @property
+    def offset(self):
+        return self._o
+
+    @property
+    def size(self):
+        return self._size
+
+
 class FractalHeap:
     def __init__(self, file, offset):
         self._f = file
         self._o = offset
 
         self._f.seek(self._o)
-        size = (19 + 12 * self._f.size_of_lengths + 3 * self._f.size_of_offsets)
+        size = (22 + 12 * self._f.size_of_lengths + 3 * self._f.size_of_offsets)
         byts = self._f.read(size)
 
         assert byts[:4] == b"FRHP"
@@ -168,15 +254,42 @@ class FractalHeap:
         value = value.bit_length()
         self._managed_object_length_size = value // 8 + min(value % 8, 1)
 
-        # estoy leyendo los 512 bytes a pelo porq se q es pequeño
-        # pero tengo que entender como sacar info del fractal heap
-        self._f.seek(self._address_root_block)
-        self._data = self._f.read(512)  # block size
-        # ahora tengo los 512 bytes del direct block
+        self._managed = []
+        if self._address_root_block != self._f.undefined_address:
+            nrows = self._current_n_of_rows_in_root_indirect_block
+            if nrows > 0:
+                block = FractalHeapIndirectBlock(self._f, self._address_root_block, self, nrows)
+                for b in block.read():
+                    self._managed.append(b)
+            else:
+                block = FractalHeapDirectBlock(self._f, self._address_root_block, self, self._starting_block_size)
+                self._managed.append(block)
 
     @property
     def nbits(self):
         return self._maximum_heap_size_bits
+
+    @property
+    def maximum_heap_size(self):
+        return self._maximum_heap_size
+
+    @property
+    def table_width(self):
+        return self._table_width
+
+    @property
+    def starting_block_size(self):
+        return self._starting_block_size
+
+    @property
+    def max_dblock_rows(self):
+        log2_maximum_direct_block_size = int(math.log2(self._maximum_direct_block_size))
+        log2_starting_block_size = int(math.log2(self._starting_block_size))
+
+        assert 2 ** log2_maximum_direct_block_size == self._maximum_direct_block_size
+        assert 2 ** log2_starting_block_size == self._starting_block_size
+
+        return log2_maximum_direct_block_size - log2_starting_block_size + 2
 
     def get_data(self, heap_id):
         firstbyte = heap_id[0]
@@ -193,8 +306,22 @@ class FractalHeap:
             nbytes = self._managed_object_length_size
             size = int.from_bytes(heap_id[data_offset:data_offset + nbytes], "little")
 
-            # return self._data[offset:offset+size]  # esto es la ñapa del __init__ al final
-            return self._address_root_block + offset
+            # calculate direct block offset
+            # ToDo this involves having all the fractal heap read into memory, fix (need to implement proper reading
+            # of the doubling table)
+            acc = 0
+            block_id = 0
+            for i, block in enumerate(self._managed):
+                block_length = block.size
+                acc += block_length
+                if offset < acc:
+                    block_id = i
+                    acc -= block_length
+                    break
+
+            # return self._managed[offset:offset + size] # Do not return data, return the offset in the file
+            a = self._managed[block_id].offset + (offset - acc)
+            return a
         elif idtype == 1:  # tiny
             raise NotImplementedError
         elif idtype == 2:  # huge
