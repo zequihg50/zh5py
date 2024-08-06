@@ -31,7 +31,7 @@ class Basic(unittest.TestCase):
         Basic.create_1d(NAME)
 
         f = zh5.File(NAME)
-        # assert_array_equal(f["1d"][:], np.arange(10))
+        assert_array_equal(f["1d"][:], np.arange(10))
         assert_array_equal(f["1dchunks"][:], np.arange(10))
         assert_array_equal(f["1dfilters"][:], np.arange(10))
         assert_array_equal(f["1dchunks"][5:], np.arange(5, 10))
@@ -55,3 +55,7 @@ class Basic(unittest.TestCase):
         f.close()
 
         os.remove(NAME)
+
+
+if __name__ == "__main__":
+    unittest.main()

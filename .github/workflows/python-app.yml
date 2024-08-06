@@ -4,12 +4,35 @@ on: [push]
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["pypy3.9", "pypy3.10", "3.9", "3.10", "3.11", "3.12"]
-
+        python-version: ["3.9", "3.10", "3.11", "3.12"]
+    # Do not ignore bash profile files. From:
+    # https://github.com/marketplace/actions/setup-miniconda
+    defaults:
+      run:
+        shell: bash -l {0}
     steps:
-      - name: Unit tests
-        run: python -m unittest
+      - uses: actions/checkout@v4
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Setup Miniconda
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          channels: conda-forge, defaults
+          python-version: ${{ matrix.python-version }}
+          use-only-tar-bz2: true  # IMPORTANT: This needs to be set for caching to work properly!
+          auto-update-conda: true
+          auto-activate-base: true
+      - shell: bash -el {0}
+        run: conda install -y h5py
+      - shell: bash -el {0}
+        run: conda init
+      - name: Basic tests
+        run: |
+          conda activate test || true
+          pip install aiohttp numcodecs
+          python -m unittest test/test_basic.py
