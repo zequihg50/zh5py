@@ -1,4 +1,6 @@
 import asyncio
+import concurrent.futures
+import urllib.request
 
 import aiohttp
 import numpy as np
@@ -275,6 +277,39 @@ class HTTPChunkReader:
         return asyncio.run(self.fetch_chunks_async(chunks))
 
 
+class HTTPThreadedChunkReader:
+    def __init__(self, fname, dataset):
+        self._url = fname
+        self._dataset = dataset
+
+    def fetch_chunk(self, chunk_id, frm, length):
+        headers = {'Range': f'bytes={frm}-{frm + length}'}
+        req = urllib.request.Request(self._url, headers=headers)
+        with urllib.request.urlopen(req) as response:
+            byts = response.read()
+
+            if self._dataset.filter_pipeline:
+                filters = list(self._dataset.filter_pipeline.filters())
+                for f in filters[::-1]:
+                    byts = f.decode(byts)
+
+        return chunk_id, byts
+
+    def fetch_chunks(self, chunks):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+            future_to_offset = {
+                executor.submit(
+                    self.fetch_chunk,
+                    c["chunk_offset"],
+                    c["byte_offset"],
+                    c["byte_length"]): c["chunk_offset"]
+                for c in chunks}
+
+            for future in concurrent.futures.as_completed(future_to_offset):
+                offset = future_to_offset[future]
+                yield future.result()
+
+
 class ChunkedDataset(Dataset):
     def __init__(self, file, do, name=None, dataspace=None, layout=None):
         super().__init__(file, do, name, dataspace)
@@ -305,7 +340,8 @@ class ChunkedDataset(Dataset):
 
         # chunk reader
         if self._f.name.startswith("http://") or self._f.name.startswith("https://"):
-            self._cr = HTTPChunkReader(self._f.raw_name, self)
+            # self._cr = HTTPChunkReader(self._f.raw_name, self)
+            self._cr = HTTPThreadedChunkReader(self._f.raw_name, self)
         else:
             self._cr = LocalChunkReader(self._f.raw_name, self)
 

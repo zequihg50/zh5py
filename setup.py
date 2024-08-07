@@ -14,6 +14,6 @@ setup(name='zh5',
           "aiohttp",
       ],
       tests_require=[
-          "h5py"
+          "h5py",
       ],
       zip_safe=False)
