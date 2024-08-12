@@ -117,7 +117,7 @@ class FilterDescriptionV2(FilterDescription):
     @property
     def size(self):
         if self._size is None:
-            self._size = 8 + len(self.name) + 4 * self._number_client_data_values
+            self._size = 6 + len(self.name) + 4 * self._number_client_data_values
 
         return self._size
 
