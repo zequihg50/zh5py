@@ -56,6 +56,15 @@ class Basic(unittest.TestCase):
 
         os.remove(NAME)
 
+    def test_list_links(self):
+        NAME = "1d.h5"
+        Basic.create_1d(NAME)
+
+        f = zh5.File(NAME)
+        assert_array_equal(list(f), ['1d', '1dchunks', '1dfilters'])
+        f.close()
+        os.remove(NAME)
+
 
 if __name__ == "__main__":
     unittest.main()

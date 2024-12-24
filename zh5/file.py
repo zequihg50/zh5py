@@ -371,6 +371,9 @@ class File:
     def __getitem__(self, item):
         return self.root_group[item]
 
+    def __iter__(self):
+        yield from self.root_group
+
     def close(self):
         self._fh.close()
 
@@ -970,6 +973,9 @@ class Group:
                     raise ValueError(f"Layout class not supported ({layout.layout_class}).")
 
             return dataset
+
+    def __iter__(self):
+        return (link.name for link in self.links())
 
     @property
     def name(self):
