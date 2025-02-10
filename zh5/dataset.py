@@ -194,8 +194,8 @@ class ContiguousDataset(Dataset):
         normalized_slice = self._normalize_hyperslab(item)
         if self._dtype.is_memmap:
             if self._f.name.startswith("https://"): # ToDo
-                fremote = HTTPRangeReader(self._f.name)
-                fremote.seek(self._address)
+                fremote = HTTPRangeReader(self._f.raw_name)
+                fremote.seek(self._f.project_chunk(self._address))
                 buff = fremote.read(self._size)
                 fremote.close()
                 arr = np.frombuffer(buff, self.dtype).reshape(self.shape)
