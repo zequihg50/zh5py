@@ -8,6 +8,7 @@ import numpy as np
 from zh5.codecs import FilterPipelineMessageV1, FilterPipelineMessageV2
 from zh5.dtypes import DatatypeMessage, FloatDatatype, VLStringDatatype, FixedPointDatatype
 from zh5.tree import BtreeV1Chunk
+from zh5.remote import HTTPRangeReader
 
 
 class DataLayoutMessageV1V2:
@@ -192,13 +193,21 @@ class ContiguousDataset(Dataset):
 
         normalized_slice = self._normalize_hyperslab(item)
         if self._dtype.is_memmap:
-            arr = np.memmap(
-                filename=self._f.name,
-                dtype=self.dtype,
-                shape=self.shape,
-                offset=self.address,
-                order="C")
-            return arr[tuple(normalized_slice)]
+            if self._f.name.startswith("https://"): # ToDo
+                fremote = HTTPRangeReader(self._f.name)
+                fremote.seek(self._address)
+                buff = fremote.read(self._size)
+                fremote.close()
+                arr = np.frombuffer(buff, self.dtype).reshape(self.shape)
+                return arr[tuple(normalized_slice)]
+            else:
+                arr = np.memmap(
+                    filename=self._f.name,
+                    dtype=self.dtype,
+                    shape=self.shape,
+                    offset=self.address,
+                    order="C")
+                return arr[tuple(normalized_slice)]
         else:
             # assume it is vlen, each cell is a global_heap_id
             heap_arr_dtype = np.dtype([
